@@ -1,4 +1,4 @@
-# map_servers/duffel_server.py
+# map_servers/flight_server.py
 
 
 from __future__ import annotations
@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -38,7 +39,11 @@ DUFFEL_PARAMS = ServerParams(
         "create_order_change": "/air/order_changes",
     },
 )
+from .flight_store import save_flight_search_results
 
+# Resolve flights DB path relative to repo root (databases/flights.sqlite)
+_FLIGHT_DB_PATH = (Path(__file__).resolve().parent.parent / "databases" / "flights.sqlite")
+_FLIGHT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def _duffel_headers(access_token: str) -> Dict[str, str]:
     return {
@@ -124,9 +129,28 @@ def search_flights_impl(
     }
 
     logger.debug("Creating offer request: %s %s", url, body)
-    resp = requests.post(url, headers=_duffel_headers(token), json=body, timeout=30)
-    resp.raise_for_status()
+    resp = None
+    try:
+        resp = requests.post(url, headers=_duffel_headers(token), json=body, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        error_payload: Any = {}
+        status_code = None
+        if resp is not None:
+            status_code = resp.status_code
+            try:
+                error_payload = resp.json()
+            except Exception:
+                error_payload = {"text": resp.text}
+        logger.error("Offer request failed: %s", e)
+        return {
+            "error": f"Duffel offer request failed: {e}",
+            "status": status_code,
+            "response": error_payload,
+            "payload_sent": body,
+        }
     offer_request = resp.json()
+    
 
     request_id = offer_request.get("data", {}).get("id")
     if not request_id:
@@ -136,144 +160,36 @@ def search_flights_impl(
     offers_url = DUFFEL_PARAMS.base_url + "/air/offers"
     params = {"offer_request_id": request_id}
     logger.debug("Fetching offers: %s %s", offers_url, params)
-    resp = requests.get(offers_url, headers=_duffel_headers(token), params=params, timeout=30)
-    resp.raise_for_status()
+    resp = None
+    try:
+        resp = requests.get(offers_url, headers=_duffel_headers(token), params=params, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        error_payload: Any = {}
+        status_code = None
+        if resp is not None:
+            status_code = resp.status_code
+            try:
+                error_payload = resp.json()
+            except Exception:
+                error_payload = {"text": resp.text}
+        logger.error("Fetching offers failed: %s", e)
+        return {
+            "error": f"Failed to fetch offers: {e}",
+            "status": status_code,
+            "response": error_payload,
+            "payload_sent": params,
+        }
     offers_data = resp.json()
 
-    raw_offers = offers_data.get("data", [])[:max_offers]
-
-    results: List[Dict[str, Any]] = []
-    for offer in raw_offers:
-        owner = offer.get("owner", {})
-        first_slice = slices[0] if slices else {}
-        return_slice = slices[1] if len(slices) > 1 else {}
-        details: Dict[str, Any] = {
-            "id": offer.get("id"),
-            "airline": owner.get("name") or "Unknown",
-            "price": float(offer.get("total_amount", 0)),
-            "currency": offer.get("total_currency", "USD"),
-            "cabin_class": cabin_class_lower,
-            "origin": first_slice.get("origin"),
-            "destination": first_slice.get("destination"),
-            "departure_date": first_slice.get("departure_date"),
-            "return_date": return_slice.get("departure_date"),
-            "passenger_ids": []
-        }
-        for pax in offer.get("passengers", []):
-            pid = pax.get("id")
-            if pid:
-                details["passenger_ids"].append(pid)
-        results.append(details)
-
-    return results
-
-# def search_flights_impl(
-#     origin: str,
-#     destination: str,
-#     departure_date: str,
-#     return_date: Optional[str] = None,
-#     passengers: int = 1,
-#     cabin_class: str = "economy",
-#     max_offers: int = 5,
-# ) -> List[Dict[str, Any]]:
-#     """
-#     Search flight offers using Duffel API.
-
-#     Args:
-#         origin: IATA code of origin airport (e.g., "LHR").
-#         destination: IATA code of destination airport (e.g., "JFK").
-#         departure_date: ISO date YYYY-MM-DD.
-#         return_date: Optional return date YYYY-MM-DD for round trip.
-#         passengers: Number of adult passengers.
-#         cabin_class: "economy", "premium_economy", "business", or "first".
-#         max_offers: Maximum number of offers to return.
-
-#     Returns:
-#         A list of flight offers with:
-#         - id: Offer ID
-#         - airline: Airline name
-#         - price: Total price
-#         - currency: Currency code
-#         - cabin_class: Cabin class
-#         - passenger_ids: List of passenger IDs
-#     """
-#     token = _get_duffel_token()
-#     if not token:
-#         logger.warning("DUFFEL_ACCESS_TOKEN not set, cannot search flights")
-#         return []
-
-#     origin = origin.upper().strip()
-#     destination = destination.upper().strip()
-#     passengers = max(1, passengers)
-#     max_offers = max(1, min(max_offers, 20))
-
-#     # Build slices
-#     slices = [{
-#         "origin": origin,
-#         "destination": destination,
-#         "departure_date": departure_date
-#     }]
-#     if return_date:
-#         slices.append({
-#             "origin": destination,
-#             "destination": origin,
-#             "departure_date": return_date
-#         })
-
-#     # Create offer request
-#     url = DUFFEL_PARAMS.base_url + DUFFEL_PARAMS.commands["search_offers"]
-#     body = {
-#         "data": {
-#             "slices": slices,
-#             "passengers": [{"type": "adult"}] * passengers,
-#             "cabin_class": cabin_class,
-#         }
-#     }
-
-#     logger.debug("Creating offer request: %s %s", url, body)
-#     resp = requests.post(url, headers=_duffel_headers(token), json=body, timeout=30)
-#     resp.raise_for_status()
-#     offer_request = resp.json()
-
-#     request_id = offer_request.get("data", {}).get("id")
-#     if not request_id:
-#         logger.error("No request_id in offer request response")
-#         return []
-
-#     # Get offers for the request
-#     offers_url = DUFFEL_PARAMS.base_url + "/air/offers"
-#     params = {"offer_request_id": request_id}
-
-#     logger.debug("Fetching offers: %s %s", offers_url, params)
-#     resp = requests.get(offers_url, headers=_duffel_headers(token), params=params, timeout=30)
-#     resp.raise_for_status()
-#     offers_data = resp.json()
-
-#     offers = offers_data.get("data", [])[:max_offers]
-
-#     results: List[Dict[str, Any]] = []
-#     for offer in offers:
-#         owner = offer.get("owner", {})
-#         offer_details = {
-#             "id": offer.get("id"),
-#             "airline": owner.get("name") or "Unknown",
-#             "price": float(offer.get("total_amount", 0)),
-#             "currency": offer.get("total_currency", "USD"),
-#             "cabin_class": cabin_class,
-#             "passenger_ids": []  # Initialize an empty list for passenger IDs
-#         }
-
-#         # Extract passenger IDs from the offer data
-#         offer_passengers = offer.get("passengers", [])
-#         for pax in offer_passengers:
-#             passenger_id = pax.get("id")
-#             if passenger_id:
-#                 offer_details["passenger_ids"].append(passenger_id)
-
-#         results.append(offer_details)
-
-#     return results
-
+    all_offers = offers_data.get("data", []) or []
+    top_offers = all_offers[:10]
+    try:
+        save_flight_search_results(top_offers, query=slices, db_path=str(_FLIGHT_DB_PATH))
+    except Exception as e:
+        print("Failed to save flight search results: %s", e)
+    # Return capped set to keep responses manageable
+    return top_offers
 
 def create_order_impl(
     offer_id: str,
@@ -418,7 +334,10 @@ def create_order_impl(
                 error_payload = resp.json()
             except Exception:
                 error_payload = {"text": resp.text}
+                print(error_payload)
+                print(order_payload)
         logger.error("Failed to create order: %s", e)
+        print(error_payload)
         return {
             "error": f"Order creation failed: {e}",
             "status": status_code,
@@ -445,7 +364,6 @@ def create_order_impl(
     }
 
     return order_details
-
 
 def get_offer_impl(offer_id: str) -> Dict[str, Any]:
     """
@@ -516,7 +434,6 @@ def get_offer_impl(offer_id: str) -> Dict[str, Any]:
         "slices": slices_out,
         "raw": data,
     }
-
 
 def request_order_change_offers_impl(
     order_id: str,
@@ -599,7 +516,6 @@ def request_order_change_offers_impl(
         "offers": simplified,
         "raw": change_offers,
     }
-
 
 def confirm_order_change_impl(
     order_change_offer_id: str,
@@ -776,102 +692,6 @@ def create_payment_impl(
         "raw": payment_data,
     }
 
-# def create_order_impl(
-#     offer_id: str,
-#     payment_type: str = "balance",
-#     passengers: List[Dict[str, Any]] = [],
-#     mode: str = "instant",
-#     create_hold: bool = False,
-# ) -> Dict[str, Any]:
-#     """
-#     Create a flight order using the Duffel API from the selected offer.
-
-#     Args:
-#         offer_id: The Duffel offer ID (e.g., "off_...").
-#         payment_type: The payment method (default: "balance").
-#         passengers: A list of passenger details.
-#         mode: "instant" or "hold" (default: "instant").
-#         create_hold: If True, creates a hold order without taking payment.
-
-#     Returns:
-#         A dictionary containing the order details.
-#     """
-#     token = _get_duffel_token()
-#     if not token:
-#         logger.warning("DUFFEL_ACCESS_TOKEN not set, cannot create order")
-#         return {"error": "Missing Duffel API token"}
-
-#     # Step 1: Get the offer details
-#     url = DUFFEL_PARAMS.base_url + DUFFEL_PARAMS.commands["get_offer"].format(offer_id=offer_id)
-#     resp = requests.get(url, headers=_duffel_headers(token), timeout=30)
-#     if resp.status_code != 200:
-#         logger.error(f"Failed to fetch offer details, status code {resp.status_code}")
-#         return {"error": "Failed to retrieve offer details"}
-
-#     offer = resp.json().get("data", {})
-#     total_amount = offer.get("total_amount")
-#     total_currency = offer.get("total_currency")
-#     offer_passengers = offer.get("passengers", [])
-
-#     # Step 2: Prepare the passengers data
-#     passengers_payload = []
-#     if passengers:
-#         for pax in passengers:
-#             pax_details = {"id": pax.get("id")}
-#             for field in ["title", "gender", "given_name", "family_name", "born_on", "email", "phone_number"]:
-#                 if pax.get(field):
-#                     pax_details[field] = pax.get(field)
-#             passengers_payload.append(pax_details)
-#     else:
-#         # Default to the passengers in the offer if no custom passenger details are provided
-#         for pax in offer_passengers:
-#             passengers_payload.append({"id": pax.get("id")})
-
-#     # Step 3: Build the order creation payload
-#     order_payload: Dict[str, Any] = {
-#         "data": {
-#             "selected_offers": [offer_id],
-#             "passengers": passengers_payload,
-#             "type": "hold" if create_hold else "instant",  # Create hold order if specified
-#         }
-#     }
-
-#     # Include payment information unless it's a hold order
-#     if not create_hold:
-#         order_payload["data"]["payments"] = [
-#             {
-#                 "type": payment_type,
-#                 "amount": total_amount,
-#                 "currency": total_currency,
-#             }
-#         ]
-
-#     # Step 4: Create the order
-#     create_order_url = DUFFEL_PARAMS.base_url + DUFFEL_PARAMS.commands["create_order"]
-#     resp = requests.post(create_order_url, headers=_duffel_headers(token), json=order_payload, timeout=60)
-#     if resp.status_code != 201:
-#         logger.error(f"Failed to create order, status code {resp.status_code}")
-#         return {"error": "Order creation failed"}
-
-#     # Parse the response
-#     order_data = resp.json().get("data", {})
-#     if not order_data:
-#         return {"error": "Order created but response parsing failed"}
-
-#     # Step 5: Return the order details
-#     order_details = {
-#         "order_id": order_data.get("id"),
-#         "booking_reference": order_data.get("booking_reference"),
-#         "total": order_data.get("total_amount"),
-#         "currency": order_data.get("total_currency"),
-#         "order_type": order_data.get("type"),
-#         "payment_required_by": order_data.get("payment_required_by"),
-#         "passengers": order_data.get("passengers"),
-#         "itinerary": order_data.get("slices"),
-#     }
-
-#     return order_details
-
 def get_order_impl(order_id: str) -> Dict[str, Any]:
     """
     Get the details of a specific order using Duffel API.
@@ -1028,8 +848,6 @@ def cancel_order_impl(order_id: str, auto_confirm: bool = True) -> Dict[str, Any
     result["refund_currency"] = confirm_data.get("refund_currency", result.get("refund_currency"))
     result["raw_confirmation"] = confirm_data
     return result
-
-
 
 # ------------------------
 # Tool-wrapped APIs
